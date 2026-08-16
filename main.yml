@@ -1,0 +1,202 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # ملاحظة: حتى لو وضعت وقتًا أطول، GitHub يوقف الجلسة تلقائيًا بعد 6 ساعات في المستودعات العامة
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # فتح منفذ RDP 3389 مباشرة على الإنترنت (بدون Tailscale / بدون أي وسيط)
+          netsh advfirewall firewall delete rule name="RDP-Public" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Public" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # إيقاف جدار الحماية كاملًا حتى لا يحجب الاتصال
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # نرسل كلمة السر للخطوات التالية (للـ webhook)
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "User: RDP | Password: $password"
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Get Public IP
+        run: |
+          # الحصول على الـ IP العام للـ runner مباشرة — تتصل به بدون أي برنامج وسيط
+          $ip = (Invoke-RestMethod -Uri "https://api.ipify.org").ToString().Trim()
+          if (-not $ip) {
+              $ip = (Invoke-RestMethod -Uri "https://ifconfig.me/ip").ToString().Trim()
+          }
+          if (-not $ip) {
+              Write-Error "Could not fetch public IP"
+              exit 1
+          }
+          echo "PUBLIC_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Public IP: $ip"
+
+      - name: Send RDP Online Webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          $expiry = (Get-Date).AddHours(6).ToString("HH:mm")
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $msg = @"
+🟢 **RDP الآن شغّال!**
+🌐 **IP العام:** $env:PUBLIC_IP
+👤 **المستخدم:** RDP
+🔑 **كلمة السر:** $env:RDP_PASSWORD
+⏰ تنتهي الجلسة تقريبًا الساعة $expiry (بعد 6 ساعات)
+🔗 الأكشن: $runUrl
+💾 **احفظ شغلك قبل انتهاء الوقت!**
+"@
+          try {
+              if ([string]::IsNullOrEmpty($env:WEBHOOK_URL)) {
+                  Write-Host "[Webhook] لم تضف secret باسم WEBHOOK_URL — الرسالة هي:`n$msg"
+              } else {
+                  $payload = @{ content = $msg } | ConvertTo-Json -Compress
+                  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                  Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes | Out-Null
+                  Write-Host "[Webhook] تم إرسال رسالة RDP Online"
+              }
+          } catch {
+              Write-Host "[Webhook] فشل الإرسال: $_"
+          }
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:PUBLIC_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+      - name: Maintain Connection + Webhooks
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          # ⏰ الإعدادات — غيّرها حسب حاجتك:
+          $startTime     = Get-Date
+          $lifetimeHours = 6    # مدة حياة الجلسة بالساعات (للمستودعات العامة = 6 ساعات مهما كان)
+          $warnAtHours   = 4.5  # ⚠️ أرسل تحذير "قرب الانتهاء" عند الوصول لهذه الساعات
+          $exitMinutes   = ($lifetimeHours * 60) - 10  # ننهي الحلقة بسلاسة قبل القطع الإجباري بـ 10 دقائق حتى نرسل رسالة الإطفاء
+
+          $expiryTime    = $startTime.AddHours($lifetimeHours)
+          $lastHourSent  = -1
+          $warningSent   = $false
+
+          function Send-Webhook([string]$message) {
+              if ([string]::IsNullOrEmpty($env:WEBHOOK_URL)) {
+                  Write-Host "[Webhook] (لا يوجد secret باسم WEBHOOK_URL)`n$message"
+                  return
+              }
+              try {
+                  $payload = @{ content = $message } | ConvertTo-Json -Compress
+                  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                  Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes | Out-Null
+                  Write-Host "[Webhook] OK"
+              } catch {
+                  Write-Host "[Webhook] فشل الإرسال: $_"
+              }
+          }
+
+          while ($true) {
+              $now       = Get-Date
+              $elapsed   = $now - $startTime
+              $remaining = $expiryTime - $now
+
+              # 🔔 كل ساعة كاملة: أرسل الوقت المتبقي حتى لا يضيع شغلك
+              $hourMark = [math]::Floor($elapsed.TotalHours)
+              if ($hourMark -ge 1 -and $hourMark -ne $lastHourSent) {
+                  $lastHourSent = $hourMark
+                  $h = [math]::Floor($remaining.TotalHours)
+                  $m = [math]::Floor($remaining.Minutes)
+                  $msg = "🔔 **تحديث الساعة $hourMark من الجلسة**`n⏳ **الوقت المتبقي:** ${h} ساعة و ${m} دقيقة`n🌐 IP: $env:PUBLIC_IP`n👤 User: RDP`n💾 احفظ شغلك قبل انتهاء الوقت!"
+                  Send-Webhook $msg
+              }
+
+              # ⚠️ عند الوصول إلى 4.5 ساعات: تحذير أن الجلسة قرب تنتهي
+              if ($elapsed.TotalHours -ge $warnAtHours -and -not $warningSent) {
+                  $warningSent = $true
+                  $h = [math]::Floor($remaining.TotalHours)
+                  $m = [math]::Floor($remaining.Minutes)
+                  $msg = "⚠️ **تنبيه: جلسة RDP قرب تنتهي!**`nتم التشغيل لمدة $warnAtHours ساعة.`n⏳ **باقي تقريبًا:** ${h} ساعة و ${m} دقيقة`n🚨 **خذ حذرك: احفظ شغلك فورًا أو أعد تشغيل الأكشن!**"
+                  Send-Webhook $msg
+              }
+
+              # 🛑 نهاية الجلسة: نخرج بسلاسة قبل القطع الإجباري حتى ترسل رسالة الإطفاء
+              if ($elapsed.TotalMinutes -ge $exitMinutes) {
+                  Write-Host "Session lifetime reached - stopping gracefully."
+                  break
+              }
+
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - IP: $env:PUBLIC_IP - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 60
+          }
+
+      - name: Send RDP Offline Webhook
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          # إذا فشل الإعداد قبل وصول الـ IP فلا نرسل رسالة إطفاء
+          if ([string]::IsNullOrEmpty($env:PUBLIC_IP)) {
+              Write-Host "Session never started - skipping offline webhook"
+              exit 0
+          }
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $msg = @"
+🔴 **انتهت جلسة RDP — الأكشن توقف**
+⏳ استمرت الجلسة حتى نهايتها المحددة.
+🔗 الرابط: $runUrl
+🔄 أعد تشغيل الأكشن من جديد لمواصلة الشغل — شغلك لم يضيع طالما أنك حفظته!
+"@
+          try {
+              if ([string]::IsNullOrEmpty($env:WEBHOOK_URL)) {
+                  Write-Host "[Webhook] لا يوجد secret باسم WEBHOOK_URL — الرسالة هي:`n$msg"
+              } else {
+                  $payload = @{ content = $msg } | ConvertTo-Json -Compress
+                  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                  Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes | Out-Null
+                  Write-Host "[Webhook] تم إرسال رسالة RDP Offline"
+              }
+          } catch {
+              Write-Host "[Webhook] فشل الإرسال: $_"
+          }
